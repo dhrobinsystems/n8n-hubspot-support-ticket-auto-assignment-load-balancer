@@ -1,0 +1,312 @@
+{
+  "name": "HubSpot Support Ticket Auto-Assignment Load Balancer (dhRobin Systems)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## HubSpot Ticket Auto-Assignment Load Balancer\n**dhRobin Systems \u00b7 MIT \u00b7 provided as-is (see DISCLAIMER.md)**\n\nSafe defaults: `DRY_RUN=true`, `SANDBOX_MODE=true`.\nLive writes happen only when **both** are `false`.\n\n1. Set env vars (see README).\n2. Test with the pinned sample payload.\n3. Review `dry_run_would_assign` output.\n4. Go live in a HubSpot test account first.\n\nNo credentials are stored in this file.",
+        "height": 400,
+        "width": 380,
+        "color": 7
+      },
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000001",
+      "name": "Read Me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hubspot-ticket-auto-assign",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000002",
+      "name": "HubSpot Ticket Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "00000000-0000-4000-8000-000000000000"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// =====================================================================\n// Open Ticket Count Check & Load Balancer\n// n8n-hubspot-support-ticket-auto-assignment-load-balancer\n// dhRobin Systems \u00b7 MIT License \u00b7 Provided as-is, see DISCLAIMER.md\n// ---------------------------------------------------------------------\n// Mode: Run Once for All Items\n// Input : HubSpot app-webhook event array OR HubSpot workflow-webhook object\n// Output: one item per unique ticket, each carrying an `action`:\n//   assign | dry_run_would_assign | skip_already_owned | skip_pipeline |\n//   skip_event_type | skip_duplicate_event | no_capacity | rejected | error\n// Only items with action === \"assign\" reach the HubSpot Owner Update node.\n// =====================================================================\n\n// ---------- 1. Configuration (environment variables, safe defaults) ----------\nconst ENV = (() => { try { return $env || {}; } catch (e) { return {}; } })();\nconst env = (key, fallback) => {\n  const v = ENV[key];\n  return v === undefined || v === null || String(v).trim() === '' ? fallback : String(v).trim();\n};\nconst isOn  = (key) => env(key, 'true').toLowerCase() !== 'false';  // fail-safe: ON unless exactly \"false\"\nconst optIn = (key) => env(key, 'false').toLowerCase() === 'true';  // opt-in: OFF unless exactly \"true\"\nconst csv   = (key, fallback) => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst int   = (key, fallback) => { const n = parseInt(env(key, String(fallback)), 10); return Number.isFinite(n) ? n : fallback; };\n\nconst HUBSPOT_API_BASE = 'https://api.hubapi.com'; // fixed on purpose: the token is never sent anywhere else\n\nconst CONFIG = {\n  DRY_RUN:               isOn('DRY_RUN'),\n  SANDBOX_MODE:          isOn('SANDBOX_MODE'),\n  AUTH_MODE:             env('WEBHOOK_AUTH_MODE', 'shared_secret').toLowerCase(), // shared_secret | hubspot_v3 | none\n  WEBHOOK_SHARED_SECRET: env('WEBHOOK_SHARED_SECRET', ''),\n  WEBHOOK_TOKEN_HEADER:  env('WEBHOOK_TOKEN_HEADER', 'x-webhook-token').toLowerCase(),\n  HUBSPOT_CLIENT_SECRET: env('HUBSPOT_CLIENT_SECRET', ''),\n  PUBLIC_WEBHOOK_URL:    env('PUBLIC_WEBHOOK_URL', ''),\n  HUBSPOT_ACCESS_TOKEN:  env('HUBSPOT_ACCESS_TOKEN', ''),\n  CLOSED_STAGE_IDS:      csv('CLOSED_STAGE_IDS', '4'),\n  OPEN_STAGE_IDS:        csv('OPEN_STAGE_IDS', ''),\n  ALLOWED_PIPELINE_IDS:  csv('ALLOWED_PIPELINE_IDS', ''),\n  ACCEPTED_EVENT_TYPES:  csv('ACCEPTED_EVENT_TYPES', 'ticket.creation'),\n  REASSIGN_IF_OWNED:     optIn('REASSIGN_IF_OWNED'),\n  FALLBACK_OWNER_ID:     env('FALLBACK_OWNER_ID', ''),\n  DEFAULT_CAPACITY:      Math.max(1, int('DEFAULT_AGENT_CAPACITY', 20)),\n  SEARCH_DELAY_MS:       Math.max(0, int('SEARCH_DELAY_MS', 250)),\n};\n\n// Live writes are only possible when BOTH flags are off.\nconst EFFECTIVE_DRY_RUN = CONFIG.DRY_RUN || CONFIG.SANDBOX_MODE;\n\n// ---------- 2. Agent pool (placeholders only \u2014 replace via AGENT_POOL_JSON) ----------\nconst PLACEHOLDER_AGENT_POOL = [\n  { ownerId: 'OWNER_ID_AGENT_A', name: 'Agent A (placeholder)', capacity: 15, active: true, priorities: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], mockOpenTickets: 7 },\n  { ownerId: 'OWNER_ID_AGENT_B', name: 'Agent B (placeholder)', capacity: 15, active: true, priorities: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'], mockOpenTickets: 3 },\n  { ownerId: 'OWNER_ID_AGENT_C', name: 'Agent C (placeholder)', capacity: 10, active: true, priorities: ['LOW', 'MEDIUM'],                   mockOpenTickets: 4 },\n  { ownerId: 'OWNER_ID_AGENT_D', name: 'Agent D (placeholder, on leave)', capacity: 15, active: false, priorities: null,                   mockOpenTickets: 0 },\n];\n\nfunction normalizeAgent(a, i) {\n  const ownerId = String((a && (a.ownerId ?? a.owner_id)) ?? '').trim();\n  if (!ownerId) throw new Error(`Agent pool entry ${i} is missing \"ownerId\".`);\n  return {\n    ownerId,\n    name: String(a.name || `Agent ${i + 1}`),\n    capacity: Math.max(1, Number(a.capacity) || CONFIG.DEFAULT_CAPACITY),\n    active: a.active !== false,\n    priorities: Array.isArray(a.priorities) && a.priorities.length ? a.priorities.map((p) => String(p).toUpperCase()) : null, // null = all priorities\n    mockOpenTickets: Math.max(0, Number(a.mockOpenTickets) || 0),\n  };\n}\n\nfunction loadAgentPool() {\n  const raw = env('AGENT_POOL_JSON', '');\n  if (!raw) return { pool: PLACEHOLDER_AGENT_POOL.map(normalizeAgent), source: 'placeholder' };\n  let parsed;\n  try { parsed = JSON.parse(raw); } catch (e) { throw new Error('AGENT_POOL_JSON is not valid JSON.'); }\n  if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('AGENT_POOL_JSON must be a non-empty JSON array.');\n  const pool = parsed.map(normalizeAgent);\n  const ids = new Set();\n  for (const a of pool) { if (ids.has(a.ownerId)) throw new Error(`Duplicate ownerId in AGENT_POOL_JSON: ${a.ownerId}`); ids.add(a.ownerId); }\n  return { pool, source: 'env' };\n}\n\nconst { pool: AGENT_POOL, source: AGENT_POOL_SOURCE } = loadAgentPool();\n\n// ---------- 3. Live-mode guard rails ----------\nconst looksPlaceholder = (v) => /YOUR_|PLACEHOLDER|CHANGE_ME|REPLACE_/i.test(String(v || ''));\nif (!CONFIG.SANDBOX_MODE) {\n  if (!CONFIG.HUBSPOT_ACCESS_TOKEN || looksPlaceholder(CONFIG.HUBSPOT_ACCESS_TOKEN)) {\n    throw new Error('SANDBOX_MODE=false requires a real HUBSPOT_ACCESS_TOKEN environment variable.');\n  }\n  if (AGENT_POOL_SOURCE === 'placeholder' || AGENT_POOL.some((a) => !/^\\d+$/.test(a.ownerId))) {\n    throw new Error('SANDBOX_MODE=false requires AGENT_POOL_JSON with numeric HubSpot owner IDs.');\n  }\n  if (CONFIG.FALLBACK_OWNER_ID && !/^\\d+$/.test(CONFIG.FALLBACK_OWNER_ID)) {\n    throw new Error('FALLBACK_OWNER_ID must be a numeric HubSpot owner ID.');\n  }\n}\n\n// ---------- 4. Helpers ----------\nconst sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\nconst lowerKeys = (obj) => Object.fromEntries(Object.entries(obj || {}).map(([k, v]) => [String(k).toLowerCase(), v]));\n\nfunction safeEqual(a, b) { // constant-time string comparison\n  a = String(a || ''); b = String(b || '');\n  let diff = a.length ^ b.length;\n  const n = Math.max(a.length, b.length);\n  for (let i = 0; i < n; i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);\n  return diff === 0 && a.length > 0;\n}\n\nfunction redact(text) {\n  return String(text || '')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-_.=]+/gi, 'Bearer [REDACTED]')\n    .replace(/pat-[a-z0-9]{2,}-[A-Za-z0-9-]+/gi, '[REDACTED_TOKEN]')\n    .slice(0, 200);\n}\n\nfunction sanitizeError(err) {\n  const status = err?.httpCode || err?.statusCode || err?.response?.status || err?.cause?.status || null;\n  return { status: status ? Number(status) : null, message: redact(err?.message || 'Unknown error') };\n}\n\nfunction hashString(s) {\n  let h = 0;\n  for (const ch of String(s)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;\n  return h;\n}\n\nconst helpers = this.helpers;\nasync function hubspot(method, path, body) {\n  if (!helpers || typeof helpers.httpRequest !== 'function') {\n    throw new Error('this.helpers.httpRequest is not available in this n8n version.');\n  }\n  const options = {\n    method,\n    url: `${HUBSPOT_API_BASE}${path}`,\n    headers: { Authorization: `Bearer ${CONFIG.HUBSPOT_ACCESS_TOKEN}`, 'Content-Type': 'application/json' },\n    json: true,\n    timeout: 10000,\n  };\n  if (body) options.body = body;\n  for (let attempt = 1; attempt <= 3; attempt++) {\n    try {\n      return await helpers.httpRequest(options);\n    } catch (err) {\n      const safe = sanitizeError(err);\n      if ((safe.status === 429 || (safe.status && safe.status >= 500)) && attempt < 3) { await sleep(1000 * attempt); continue; }\n      const wrapped = new Error(`HubSpot ${method} ${path.split('?')[0]} failed`);\n      wrapped.safe = safe;\n      throw wrapped;\n    }\n  }\n}\n\n// ---------- 5. Webhook authentication ----------\nfunction verifyHubSpotV3(item, headers) {\n  if (!CONFIG.HUBSPOT_CLIENT_SECRET || looksPlaceholder(CONFIG.HUBSPOT_CLIENT_SECRET)) return { ok: false, reason: 'hubspot_client_secret_not_configured' };\n  let crypto;\n  try { crypto = require('crypto'); } catch (e) { return { ok: false, reason: 'crypto_module_not_allowed_set_NODE_FUNCTION_ALLOW_BUILTIN' }; }\n  const signature = headers['x-hubspot-signature-v3'];\n  const timestamp = headers['x-hubspot-request-timestamp'];\n  if (!signature || !timestamp) return { ok: false, reason: 'signature_headers_missing' };\n  if (Math.abs(Date.now() - Number(timestamp)) > 5 * 60 * 1000) return { ok: false, reason: 'signature_timestamp_out_of_window' };\n  const uri = CONFIG.PUBLIC_WEBHOOK_URL || item.webhookUrl || '';\n  const rawBody = typeof item.body === 'string' ? item.body : JSON.stringify(item.body ?? '');\n  const expected = crypto.createHmac('sha256', CONFIG.HUBSPOT_CLIENT_SECRET).update(`POST${uri}${rawBody}${timestamp}`, 'utf8').digest('base64');\n  return safeEqual(expected, signature) ? { ok: true, reason: 'hubspot_v3_signature_valid' } : { ok: false, reason: 'hubspot_v3_signature_mismatch' };\n}\n\nfunction authenticate(item) {\n  const headers = lowerKeys(item.headers);\n  switch (CONFIG.AUTH_MODE) {\n    case 'none':\n      return CONFIG.SANDBOX_MODE ? { ok: true, reason: 'auth_disabled_sandbox_only' } : { ok: false, reason: 'auth_mode_none_not_allowed_live' };\n    case 'hubspot_v3':\n      return verifyHubSpotV3(item, headers);\n    case 'shared_secret':\n    default: {\n      const secret = CONFIG.WEBHOOK_SHARED_SECRET;\n      if (!secret || looksPlaceholder(secret)) return { ok: false, reason: 'shared_secret_not_configured' };\n      const provided = headers[CONFIG.WEBHOOK_TOKEN_HEADER] || (item.query && item.query.token) || '';\n      return safeEqual(secret, provided) ? { ok: true, reason: 'shared_secret_valid' } : { ok: false, reason: 'shared_secret_mismatch' };\n    }\n  }\n}\n\n// ---------- 6. Payload normalisation (app webhooks + workflow webhooks) ----------\nfunction extractEvents(item) {\n  const body = item.body !== undefined ? item.body : item;\n  const list = Array.isArray(body) ? body : [body];\n  const events = [];\n  for (const ev of list) {\n    if (!ev || typeof ev !== 'object') continue;\n    const props = ev.properties && typeof ev.properties === 'object' ? ev.properties : {};\n    const pv = (k) => { const v = props[k]; return v && typeof v === 'object' && 'value' in v ? v.value : v; };\n    const ticketId = ev.objectId ?? ev.ticketId ?? ev.hs_object_id ?? pv('hs_object_id');\n    const priority = pv('hs_ticket_priority') ?? ev.hs_ticket_priority ?? ev.priority ?? null;\n    events.push({\n      ticketId: ticketId !== undefined && ticketId !== null ? String(ticketId).trim() : null,\n      eventId: ev.eventId !== undefined ? String(ev.eventId) : null,\n      subscriptionType: ev.subscriptionType || null,\n      source: ev.subscriptionType ? 'app_webhook' : 'workflow_webhook',\n      priority: priority ? String(priority).toUpperCase() : null,\n      pipeline: pv('hs_pipeline') ?? ev.hs_pipeline ?? null,\n      existingOwnerId: pv('hubspot_owner_id') ?? ev.hubspot_owner_id ?? null,\n    });\n  }\n  return events;\n}\n\n// ---------- 7. Open ticket count check (once per execution) ----------\nasync function buildLoadSnapshot() {\n  const snapshot = [];\n  for (const agent of AGENT_POOL) {\n    const row = { ...agent, openTickets: null, countSource: null, countError: null };\n    if (!agent.active) { row.countSource = 'skipped_inactive'; snapshot.push(row); continue; }\n    if (CONFIG.SANDBOX_MODE) { row.openTickets = agent.mockOpenTickets; row.countSource = 'mock'; snapshot.push(row); continue; }\n    try {\n      const filters = [{ propertyName: 'hubspot_owner_id', operator: 'EQ', value: agent.ownerId }];\n      if (CONFIG.OPEN_STAGE_IDS.length) filters.push({ propertyName: 'hs_pipeline_stage', operator: 'IN', values: CONFIG.OPEN_STAGE_IDS });\n      else if (CONFIG.CLOSED_STAGE_IDS.length) filters.push({ propertyName: 'hs_pipeline_stage', operator: 'NOT_IN', values: CONFIG.CLOSED_STAGE_IDS });\n      const res = await hubspot('POST', '/crm/v3/objects/tickets/search', { filterGroups: [{ filters }], properties: ['hs_object_id'], limit: 1 });\n      row.openTickets = Number(res?.total ?? 0);\n      row.countSource = 'hubspot_search';\n    } catch (err) {\n      row.countError = err.safe || sanitizeError(err);\n      row.countSource = 'error'; // agent is excluded from this run rather than guessed at\n    }\n    snapshot.push(row);\n    if (CONFIG.SEARCH_DELAY_MS) await sleep(CONFIG.SEARCH_DELAY_MS); // respect HubSpot search rate limits\n  }\n  return snapshot;\n}\n\nconst staticData = (() => { try { return $getWorkflowStaticData('global'); } catch (e) { return {}; } })();\nstaticData.lastAssignedAt = staticData.lastAssignedAt || {};\n\n// ---------- 8. Load balancer ----------\n// Lowest utilisation (open / capacity) wins; ties go to the lower raw count,\n// then the agent assigned least recently, then a deterministic per-ticket rotation.\nfunction selectAgent(ticketId, priority, snapshot) {\n  const withCapacity = snapshot.filter((r) => r.active && Number.isFinite(r.openTickets) && r.openTickets < r.capacity);\n  let candidates = withCapacity.filter((r) => !r.priorities || !priority || r.priorities.includes(priority));\n  let note = null;\n  if (!candidates.length && withCapacity.length) { candidates = withCapacity; note = 'no_priority_match_fallback_to_any_agent_with_capacity'; }\n  if (!candidates.length) return null;\n  const rotation = hashString(ticketId);\n  const last = (id) => staticData.lastAssignedAt[id] || 0;\n  candidates.sort((a, b) =>\n    (a.openTickets / a.capacity) - (b.openTickets / b.capacity) ||\n    a.openTickets - b.openTickets ||\n    last(a.ownerId) - last(b.ownerId) ||\n    ((hashString(a.ownerId) + rotation) % 997) - ((hashString(b.ownerId) + rotation) % 997)\n  );\n  return { agent: candidates[0], note };\n}\n\nconst viewSnapshot = (snapshot) => snapshot.map((r) => ({\n  ownerId: r.ownerId,\n  name: r.name,\n  active: r.active,\n  openTickets: r.openTickets,\n  capacity: r.capacity,\n  utilization: Number.isFinite(r.openTickets) ? Math.round((r.openTickets / r.capacity) * 1000) / 1000 : null,\n  countSource: r.countSource,\n  countError: r.countError,\n}));\n\n// ---------- 9. Main ----------\nconst inputs = $input.all();\nconst results = [];\nconst evaluatedAt = new Date().toISOString();\nconst mode = { dryRun: EFFECTIVE_DRY_RUN, sandbox: CONFIG.SANDBOX_MODE, agentPoolSource: AGENT_POOL_SOURCE };\nconst seen = new Set();\nlet loadSnapshot = null;\n\nfor (let i = 0; i < inputs.length; i++) {\n  const item = inputs[i].json || {};\n  const auth = authenticate(item);\n\n  if (!auth.ok && !CONFIG.SANDBOX_MODE) {\n    // Sanitised: no payload, no headers, no reason detail beyond a generic code.\n    results.push({ json: { action: 'rejected', reason: 'unauthenticated_request', evaluatedAt, mode }, pairedItem: { item: i } });\n    continue;\n  }\n\n  const events = extractEvents(item);\n  if (!events.length) {\n    results.push({ json: { action: 'error', reason: 'no_events_in_payload', evaluatedAt, mode, authCheck: auth.reason }, pairedItem: { item: i } });\n    continue;\n  }\n\n  for (const ev of events) {\n    const base = {\n      ticketId: ev.ticketId,\n      eventId: ev.eventId,\n      source: ev.source,\n      subscriptionType: ev.subscriptionType,\n      priority: ev.priority,\n      pipeline: ev.pipeline,\n      evaluatedAt,\n      mode,\n      authCheck: auth.reason,\n      correlationId: `${ev.ticketId || 'unknown'}-${Date.now()}`,\n    };\n    const emit = (action, extra = {}) => results.push({\n      json: { ...base, action, selectedOwnerId: null, selectedAgentName: null, ...extra },\n      pairedItem: { item: i },\n    });\n\n    const validId = ev.ticketId && /^[A-Za-z0-9_-]{1,40}$/.test(ev.ticketId) && (CONFIG.SANDBOX_MODE || /^\\d+$/.test(ev.ticketId));\n    if (!validId) { emit('error', { ticketId: null, reason: 'invalid_or_missing_ticket_id' }); continue; }\n    if (seen.has(ev.ticketId)) { emit('skip_duplicate_event', { reason: 'ticket_already_processed_in_this_batch' }); continue; }\n    seen.add(ev.ticketId);\n\n    if (ev.subscriptionType && !CONFIG.ACCEPTED_EVENT_TYPES.includes(ev.subscriptionType)) {\n      emit('skip_event_type', { reason: `event_type_not_accepted:${ev.subscriptionType}` }); continue;\n    }\n\n    // Current ticket state (live reads only). Doubles as the idempotency check for HubSpot retries.\n    let ownerId = ev.existingOwnerId;\n    if (!CONFIG.SANDBOX_MODE) {\n      try {\n        const t = await hubspot('GET', `/crm/v3/objects/tickets/${encodeURIComponent(ev.ticketId)}?properties=hubspot_owner_id,hs_pipeline,hs_pipeline_stage,hs_ticket_priority`);\n        const p = (t && t.properties) || {};\n        ownerId = p.hubspot_owner_id || null;\n        base.pipeline = p.hs_pipeline || null;\n        base.priority = p.hs_ticket_priority ? String(p.hs_ticket_priority).toUpperCase() : null;\n      } catch (err) {\n        emit('error', { reason: 'ticket_lookup_failed', error: err.safe || sanitizeError(err) }); continue;\n      }\n    }\n\n    if (ownerId && !CONFIG.REASSIGN_IF_OWNED) { emit('skip_already_owned', { reason: 'ticket_already_has_owner', existingOwnerId: String(ownerId) }); continue; }\n    if (CONFIG.ALLOWED_PIPELINE_IDS.length && !CONFIG.ALLOWED_PIPELINE_IDS.includes(String(base.pipeline))) {\n      emit('skip_pipeline', { reason: 'pipeline_not_in_ALLOWED_PIPELINE_IDS' }); continue;\n    }\n\n    if (!loadSnapshot) loadSnapshot = await buildLoadSnapshot();\n    const snapshotView = viewSnapshot(loadSnapshot);\n    const pick = selectAgent(ev.ticketId, base.priority, loadSnapshot);\n\n    if (!pick) {\n      if (CONFIG.FALLBACK_OWNER_ID) {\n        emit(EFFECTIVE_DRY_RUN ? 'dry_run_would_assign' : 'assign', {\n          selectedOwnerId: CONFIG.FALLBACK_OWNER_ID, selectedAgentName: 'Fallback owner',\n          reason: 'all_agents_at_capacity_fallback_owner', loadSnapshot: snapshotView,\n        });\n      } else {\n        emit('no_capacity', { reason: 'all_agents_at_capacity_or_unavailable', loadSnapshot: snapshotView });\n      }\n      continue;\n    }\n\n    const agent = pick.agent;\n    const loadBefore = agent.openTickets;\n    agent.openTickets += 1; // batch-aware: later tickets in this execution see the new load\n    if (!EFFECTIVE_DRY_RUN) staticData.lastAssignedAt[agent.ownerId] = Date.now();\n\n    emit(EFFECTIVE_DRY_RUN ? 'dry_run_would_assign' : 'assign', {\n      selectedOwnerId: agent.ownerId,\n      selectedAgentName: agent.name,\n      selectedAgentLoadBefore: loadBefore,\n      selectedAgentCapacity: agent.capacity,\n      reason: pick.note || 'lowest_utilization',\n      loadSnapshot: snapshotView,\n    });\n  }\n}\n\nreturn results;\n"
+      },
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000003",
+      "name": "Open Ticket Count Check & Load Balancer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "4d2f9a10-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "assign",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000004",
+      "name": "Should Assign?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/tickets/{{ $json.ticketId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: { hubspot_owner_id: String($json.selectedOwnerId) } }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000005",
+      "name": "HubSpot Owner Update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        -100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Audit Log \u2014 compact, secret-free record of a confirmed assignment.\n// Mode: Run Once for Each Item\nconst decision = $('Open Ticket Count Check & Load Balancer').item.json;\nconst res = $json || {};\n\nreturn {\n  json: {\n    status: 'assigned',\n    ticketId: decision.ticketId,\n    ownerId: decision.selectedOwnerId,\n    agentName: decision.selectedAgentName,\n    reason: decision.reason,\n    agentLoadBefore: decision.selectedAgentLoadBefore ?? null,\n    agentCapacity: decision.selectedAgentCapacity ?? null,\n    hubspotConfirmedOwnerId: (res.properties && res.properties.hubspot_owner_id) || null,\n    hubspotUpdatedAt: res.updatedAt || null,\n    correlationId: decision.correlationId,\n    loggedAt: new Date().toISOString(),\n  },\n};\n"
+      },
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000006",
+      "name": "Audit Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Sanitized Error Handler \u2014 strips tokens and request internals from HubSpot errors.\n// Mode: Run Once for Each Item\nconst decision = $('Open Ticket Count Check & Load Balancer').item.json;\nconst err = $json.error || {};\nconst raw = typeof err === 'string' ? err : (err.message || err.description || 'HubSpot owner update failed');\nconst message = String(raw)\n  .replace(/Bearer\\s+[A-Za-z0-9\\-_.=]+/gi, 'Bearer [REDACTED]')\n  .replace(/pat-[a-z0-9]{2,}-[A-Za-z0-9-]+/gi, '[REDACTED_TOKEN]')\n  .slice(0, 200);\nconst httpStatus = Number(err.httpCode || err.status || err.statusCode) || null;\n\nconst HINTS = {\n  400: 'HubSpot rejected the owner ID. Confirm the owner exists in this portal and can own tickets.',\n  401: 'Access token invalid or expired. Rotate HUBSPOT_ACCESS_TOKEN.',\n  403: 'Token is missing the \"tickets\" scope.',\n  404: 'Ticket not found. It may have been deleted or belongs to another portal.',\n  429: 'HubSpot rate limit hit. Increase SEARCH_DELAY_MS or reduce concurrency.',\n};\n\nreturn {\n  json: {\n    status: 'assignment_failed',\n    ticketId: decision.ticketId,\n    intendedOwnerId: decision.selectedOwnerId,\n    httpStatus,\n    message,\n    hint: HINTS[httpStatus] || 'Check the n8n execution log and HubSpot API status.',\n    correlationId: decision.correlationId,\n    loggedAt: new Date().toISOString(),\n  },\n};\n"
+      },
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000007",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "=Ticket {{ $json.ticketId }} assignment failed (HTTP {{ $json.httpStatus }}): {{ $json.message }} | {{ $json.hint }}"
+      },
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000008",
+      "name": "Raise Sanitized Error",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "0b6f3f2e-5a51-4c1e-9d8a-1f0000000009",
+      "name": "Dry Run / Skip Report",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        720,
+        160
+      ]
+    }
+  ],
+  "connections": {
+    "HubSpot Ticket Webhook": {
+      "main": [
+        [
+          {
+            "node": "Open Ticket Count Check & Load Balancer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Ticket Count Check & Load Balancer": {
+      "main": [
+        [
+          {
+            "node": "Should Assign?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Assign?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Owner Update",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dry Run / Skip Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Owner Update": {
+      "main": [
+        [
+          {
+            "node": "Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Raise Sanitized Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "HubSpot Ticket Webhook": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-token": "YOUR_WEBHOOK_SHARED_SECRET"
+          },
+          "params": {},
+          "query": {},
+          "body": [
+            {
+              "eventId": 100000001,
+              "subscriptionId": 1000001,
+              "portalId": 12345678,
+              "appId": 1000000,
+              "occurredAt": 1763200000000,
+              "subscriptionType": "ticket.creation",
+              "attemptNumber": 0,
+              "objectId": 1001,
+              "changeFlag": "CREATED",
+              "changeSource": "CRM_UI"
+            },
+            {
+              "eventId": 100000002,
+              "subscriptionId": 1000001,
+              "portalId": 12345678,
+              "appId": 1000000,
+              "occurredAt": 1763200005000,
+              "subscriptionType": "ticket.creation",
+              "attemptNumber": 0,
+              "objectId": 1002,
+              "changeFlag": "CREATED",
+              "changeSource": "FORM"
+            },
+            {
+              "eventId": 100000001,
+              "subscriptionId": 1000001,
+              "portalId": 12345678,
+              "appId": 1000000,
+              "occurredAt": 1763200000000,
+              "subscriptionType": "ticket.creation",
+              "attemptNumber": 1,
+              "objectId": 1001,
+              "changeFlag": "CREATED",
+              "changeSource": "CRM_UI"
+            }
+          ],
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/hubspot-ticket-auto-assign",
+          "executionMode": "test"
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "00000000-0000-4000-8000-000000000001",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "REPLACE_WITH_YOUR_INSTANCE_ID_OR_REMOVE"
+  },
+  "tags": []
+}
