@@ -38,6 +38,8 @@ This workflow measures each agent's **live open-ticket count** in HubSpot at the
 
 ## Architecture
 
+![n8n HubSpot Support Ticket Auto-Assignment Load Balancer Workflow](workflow-overview.png)
+
 ```mermaid
 flowchart LR
     A[HubSpot<br/>ticket.creation] -->|POST| B[HubSpot Ticket Webhook]
